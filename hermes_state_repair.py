@@ -625,6 +625,33 @@ def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
         return False
 
 
+# config.yaml path -> (its load_config() cache signature, database.synchronous read under it)
+_GUEST_SYNCHRONOUS_BY_CONFIG: dict[str, tuple[tuple[Any, ...], Any]] = {}
+
+
+def _guest_synchronous_setting() -> Any:
+    """``database.synchronous`` of the config in scope, loaded once per config revision.
+    Guests open ``state.db`` often (async delegation, ledger sweeps), and a full load per open
+    re-expanded every ``${env:}`` ref of the config. A multiplexed ledger sweep binds an empty
+    secret scope, so each open logged one placeholder warning per ref (#148624). Keyed on the
+    signature ``load_config()`` caches on, so an edit of the user or managed file still applies."""
+    from hermes_cli.config import (  # local: avoids an import cycle
+        _load_config_cache_sig,
+        cfg_get,
+        get_config_path,
+        load_config_readonly,
+    )
+    path_key = str(get_config_path())
+    _, cache_sig = _load_config_cache_sig(Path(path_key))
+    cached = _GUEST_SYNCHRONOUS_BY_CONFIG.get(path_key)
+    if cache_sig is not None and cached is not None and cached[0] == cache_sig:
+        return cached[1]
+    value = cfg_get(load_config_readonly(), "database", "synchronous", default=None)
+    if cache_sig is not None:
+        _GUEST_SYNCHRONOUS_BY_CONFIG[path_key] = (cache_sig, value)
+    return value
+
+
 def apply_durability_barriers(conn: sqlite3.Connection) -> bool:
     """Durability barriers for guest users of ``state.db`` that must inherit its owner's journal mode. Also
     applies the configured ``database.synchronous`` level, a per-connection pragma that otherwise only
@@ -632,8 +659,7 @@ def apply_durability_barriers(conn: sqlite3.Connection) -> bool:
     from hermes_state_wal import _apply_synchronous_pragma
     ok = _reapply_durability_barriers(conn)
     with contextlib.suppress(Exception):
-        from hermes_cli.config import cfg_get, load_config_readonly  # local: avoids an import cycle
-        if (raw_synchronous := cfg_get(load_config_readonly(), "database", "synchronous", default=None)) is not None:
+        if (raw_synchronous := _guest_synchronous_setting()) is not None:
             _apply_synchronous_pragma(conn, raw_synchronous, db_label="state.db (guest)")
     return ok
 
